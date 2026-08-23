@@ -76,7 +76,9 @@ docs/superpowers/specs/    this document
 ### Model facts (from the HF config)
 
 `hidden_size` 288, 6 encoder layers, 6 decoder layers, 8 heads, head dim 36
-padded to 40 (`pad_head_dim_to_multiple_of: 8`), vocab 32768,
+(HF pads it to 40 inside its attention kernel for alignment only — the
+padding is zeros, so dot products are unchanged and the converted model keeps
+36), vocab 32768,
 `max_position_embeddings` 194, `decoder_start_token_id` / bos 1, eos 2,
 RoPE with `partial_rotary_factor` 0.9. Encoder input is raw 16 kHz float audio
 in [-1, 1]. Tokenizer is Llama-style BPE with `▁` word markers and `<0xNN>`
@@ -93,13 +95,18 @@ fp16 ML programs with minimum deployment target watchOS 11 / iOS 18 / macOS 15.
   well and flexible `RangeDim` shapes poorly; callers zero-pad audio to the next
   bucket. Output `encoder_states` `[1, F, 288]`.
 - **`Decoder.mlpackage`** — stateful (`ct.StateType`): self-attention KV cache
-  state `[6 layers, 1, 8, 194, 40]` fp16 for K and for V. Inputs `token`
-  int32 `[1, 1]`, `encoder_states` (enumerated F matching the encoder buckets),
-  `position` int32 `[1]` (write index into the cache). Output `next_token`
-  int32 — the argmax is computed inside the model so 32768 logits never cross
-  the Core ML boundary per step. Cross-attention K/V are recomputed every step
-  in v1; at this size it is cheap, and precomputing them is an optimisation to
-  take only if profiling says so.
+  states `k_cache` and `v_cache`, each `[6 layers, 1, 8, 194, 36]` fp16. Every
+  shape is fixed, which is what the Neural Engine likes best. Inputs: `token`
+  int32 `[1, 1]`; `encoder_states` fp16 `[1, 500, 288]` — the encoder output
+  zero-padded to 500 frames (12 s of audio is 498 frames); `frames` int32 `[1]`
+  (how many of the 500 are real); `position` int32 `[1]` (index of `token` in
+  the sequence, 0 for bos). The causal mask, the encoder padding mask, and the
+  one-hot cache write are all derived from `frames` and `position` inside the
+  model, so there are no dynamic slices. Output `next_token` int32 `[1]` — the
+  argmax is computed inside the model so 32768 logits never cross the Core ML
+  boundary per step. Cross-attention K/V are recomputed every step in v1; at
+  this size it is cheap, and precomputing them is an optimisation to take only
+  if profiling says so.
 - **`export_vocab.py`** — `vocab.json`, an array of 32768 token strings.
 - After conversion, `xcrun coremlcompiler compile` produces `Encoder.mlmodelc`
   and `Decoder.mlmodelc`. Those two directories plus `vocab.json` are zipped as
@@ -125,8 +132,9 @@ fp16 ML programs with minimum deployment target watchOS 11 / iOS 18 / macOS 15.
   space.
 - **`Transcriber`** — an actor. `transcribe(_ samples: [Int16]) async throws ->
   String`: Int16 → Float / 32768, encode, greedy decode from bos until eos or
-  `maxTokens = min(194, Int(seconds × 6.5) + 2)`, then `TokenDecoder`. One
-  model instance, one request at a time.
+  `maxTokens = min(193, Int(seconds × 6.5) + 2)` generated tokens (194
+  positions including bos), then `TokenDecoder`. A fresh decoder `MLState` per
+  utterance. One model instance, one request at a time.
 - **`Segmenter`** — a value type fed `[Int16]` chunks; returns events.
   Closed until chunk RMS ≥ 50 (`EnergyGate` logic ported from
   `mac-live-captions`, including the 300 ms pre-roll so the utterance onset is
@@ -190,8 +198,10 @@ CaptionEngine` (the protocol is `start()`, `send(Data)`, `close()`, `onEvent`,
 - Partial → `.caption(text:isFinal:false, channel:nil)`; final →
   `.caption(text:isFinal:true, channel:nil)`. `CaptionStore` and `CaptionView`
   are untouched.
-- `close()` — flush the open segment as a final, reset the transcriber, keep
-  the models.
+- `close()` — drop any open segment and queued work, keep the models.
+  (`SessionController.stop()` clears `running` before calling `close()`, so a
+  final flushed here would be discarded anyway; `LiveTranscriber.flush()`
+  exists for callers that do want it.)
 - An inference error drops that segment and the session continues; three
   consecutive failures emit `.error("On-device captions failed")`, which makes
   `SessionController` stop the session as it does today.
