@@ -46,7 +46,7 @@
 
 ---
 
-### Task A1: Package scaffold, test assets, TokenDecoder
+### Task 1: Package scaffold, test assets, TokenDecoder
 
 **Files:**
 - Create: `Package.swift`, `.gitignore`, `LICENSE`, `README.md` (stub), `Scripts/make-test-assets.sh`, `test-assets/*.wav`, `test-assets/*.say.txt`
@@ -241,7 +241,7 @@ git commit -m "feat: package scaffold, test clips and TokenDecoder"
 
 ---
 
-### Task A2: Segmenter
+### Task 2: Segmenter
 
 **Files:**
 - Create: `Sources/MoonshineKit/Segmenter.swift`
@@ -509,7 +509,7 @@ git commit -m "feat: Segmenter cuts PCM into utterances with interim ticks"
 
 ---
 
-### Task A3: LiveTranscriber
+### Task 3: LiveTranscriber
 
 **Files:**
 - Create: `Sources/MoonshineKit/LiveTranscriber.swift`
@@ -875,7 +875,7 @@ git commit -m "feat: LiveTranscriber runs segments serially with coalesced inter
 
 ---
 
-### Task A4: Python conversion — vocab, encoder, decoder, compiled models
+### Task 4: Python conversion — vocab, encoder, decoder, compiled models
 
 **Files:**
 - Create: `convert/pyproject.toml`, `convert/export_vocab.py`, `convert/convert.py`, `convert/README.md`
@@ -1164,7 +1164,7 @@ git commit -m "feat(convert): Core ML export of the Moonshine Tiny encoder and s
 
 ---
 
-### Task A5: Parity test and golden transcripts
+### Task 5: Parity test and golden transcripts
 
 **Files:**
 - Create: `convert/parity_test.py`
@@ -1287,7 +1287,7 @@ git commit -m "test(convert): HF vs Core ML parity check and golden transcripts"
 
 ---
 
-### Task A6: MoonshineModel, Transcriber, WAVReader, integration test
+### Task 6: MoonshineModel, Transcriber, WAVReader, integration test
 
 **Files:**
 - Create: `Sources/MoonshineKit/MoonshineModel.swift`, `Sources/MoonshineKit/Transcriber.swift`, `Sources/MoonshineKit/WAVReader.swift`
@@ -1630,7 +1630,7 @@ git commit -m "feat: MoonshineModel and Transcriber run the Core ML models end t
 
 ---
 
-### Task A7: `moonshine-bench`
+### Task 7: `moonshine-bench`
 
 **Files:**
 - Modify: `Sources/moonshine-bench/main.swift` (replace the placeholder)
@@ -1734,7 +1734,7 @@ git commit -m "feat: moonshine-bench prints transcript and timings, with a --liv
 
 ---
 
-### Task A8: Release packaging, docs, GitHub repo and v0.1.0 release
+### Task 8: Release packaging, docs, GitHub repo and v0.1.0 release
 
 **Files:**
 - Create: `Scripts/package-models.sh`, `Scripts/fetch-models.sh`
