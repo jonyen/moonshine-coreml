@@ -2,6 +2,7 @@
 .swiftpm/
 build/
 build-base/
+build-parakeet/
 dist/
 .superpowers/
 convert/.venv/
