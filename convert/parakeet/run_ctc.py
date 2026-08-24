@@ -7,8 +7,13 @@ separate CTC head mlpackage), transcribes the repo test clips with CPU-only
 compute, compares against the golden .txt transcripts, and times a warm run.
 
 Usage:
-    .venv-parakeet/bin/python run_ctc.py            # full evidence run
-    .venv-parakeet/bin/python run_ctc.py file.wav   # one-off transcription
+    .venv-parakeet/bin/python run_ctc.py                    # full evidence run
+    .venv-parakeet/bin/python run_ctc.py file.wav           # one-off transcription
+    .venv-parakeet/bin/python run_ctc.py --precision int8   # int8 build (models/int8/)
+
+--precision fp16 (the default) runs the packages in models/ — their weights are
+already FLOAT16 despite metadata.json claiming FLOAT32. int8 runs models/int8/,
+produced by make_int8.py.
 """
 import json
 import sys
@@ -50,15 +55,16 @@ def decode_ctc(log_probs: np.ndarray, vocab: list[str], blank_id: int) -> str:
 
 
 class ParakeetCTC:
-    def __init__(self, compute_units=ct.ComputeUnit.CPU_ONLY):
+    def __init__(self, compute_units=ct.ComputeUnit.CPU_ONLY, precision="fp16"):
+        packages = MODELS if precision == "fp16" else MODELS / precision
         self.meta = json.loads((MODELS / "metadata.json").read_text())
         self.vocab = json.loads((MODELS / "vocab.json").read_text())
         self.blank_id = self.meta["blank_id"]
         self.max_samples = self.meta["max_audio_samples"]  # 240000 = 15 s
         self.mel_enc = ct.models.MLModel(
-            str(MODELS / "parakeet_mel_encoder.mlpackage"), compute_units=compute_units)
+            str(packages / "parakeet_mel_encoder.mlpackage"), compute_units=compute_units)
         self.ctc = ct.models.MLModel(
-            str(MODELS / "parakeet_ctc_decoder.mlpackage"), compute_units=compute_units)
+            str(packages / "parakeet_ctc_decoder.mlpackage"), compute_units=compute_units)
 
     def transcribe(self, audio: np.ndarray) -> str:
         actual = min(len(audio), self.max_samples)
@@ -80,13 +86,19 @@ def normalize(s: str) -> str:
 
 
 def main():
-    model = ParakeetCTC(compute_units=ct.ComputeUnit.CPU_ONLY)
+    args = sys.argv[1:]
+    precision = "fp16"
+    if "--precision" in args:
+        i = args.index("--precision")
+        precision = args[i + 1]
+        del args[i:i + 2]
+    model = ParakeetCTC(compute_units=ct.ComputeUnit.CPU_ONLY, precision=precision)
 
-    if len(sys.argv) > 1:
-        print(model.transcribe(load_wav(Path(sys.argv[1]))))
+    if args:
+        print(model.transcribe(load_wav(Path(args[0]))))
         return
 
-    print("Compute units: CPU_ONLY\n")
+    print(f"Compute units: CPU_ONLY, precision: {precision}\n")
     results = []
     for name in ("hello", "weather", "coffee"):
         wav = TEST_ASSETS / f"{name}.wav"

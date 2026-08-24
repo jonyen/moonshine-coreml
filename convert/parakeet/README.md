@@ -62,9 +62,12 @@ mel+encoder ≈ 24.8 ms (for the full padded 15 s window — cost is length-inde
 
 ## Model facts
 
-- **Size on disk (CTC path):** 217.5 MB — encoder mlpackage 216.5 MB (FP32 weights),
-  CTC head 1.1 MB. The int8 sibling repo would cut this ~4×; FluidInference's FP16 split is
-  ~106 MB. Compare Moonshine tiny at ~27M params.
+- **Size on disk (CTC path):** 217.5 MB — encoder mlpackage 216.5 MB, CTC head 1.1 MB.
+  ~~FP32 weights~~ *Correction (productization):* the weights are already **FLOAT16** —
+  metadata.json's "FLOAT32" describes the I/O, not the consts (717 of 718 float consts in the
+  serialized MIL program are fp16; 206 MB weight.bin ≈ 103 M fp16 params — fp32 would be twice
+  that). So an FP16 re-conversion is a no-op; the size reduction that exists from here is int8
+  (see the addendum below). Compare Moonshine tiny at ~27M params.
 - **I/O contract:** `audio_signal` `(1, 240000)` float32 raw 16 kHz audio (fixed 15 s window,
   zero-padded) + `audio_length` `(1,)` int32 → `encoder` `(1, 512, 188)` + `encoder_length`.
   CTC head: `encoder` → `log_probs` `(1, 188, 1025)`. Slice to `encoder_length` frames before
@@ -99,9 +102,28 @@ mel+encoder ≈ 24.8 ms (for the full padded 15 s window — cost is length-inde
 - Long-form chunking + streaming UX: shared with whatever Moonshine already does; incremental.
 - License: CC-BY-4.0 (model and conversions) — attribution required, commercial use fine.
 
+## Productization addendum (v0.3.0)
+
+The spike graduated: `ParakeetKit` (in `Sources/ParakeetKit/`) is the Swift port of
+`run_ctc.py` — `ParakeetModel` + `CTCDecoder` + `ParakeetTranscriber`, conforming to
+MoonshineKit's `Transcribing` so the live pipeline reuses unchanged. `Scripts/package-models.sh
+<version> parakeet` compiles the mlpackages here into `build-parakeet/` and zips the release
+asset; see the Parakeet section of the top-level README.
+
+Two findings beyond the spike:
+
+1. **The "fp32" packages were already fp16** (see the corrected size fact above), so the
+   planned FLOAT16 re-conversion pass would change nothing and was dropped.
+2. **int8 halves the size with exact parity.** `make_int8.py` applies per-channel
+   linear-symmetric int8 weight quantization (`coremltools.optimize.coreml`), 216.5 → 109.2 MB
+   for the encoder, 1.1 → 0.5 MB for the CTC head. `run_ctc.py --precision int8` reproduces all
+   three golden transcripts character-for-character, same as the fp16 originals.
+
 ## Files
 
 - `fetch_models.sh` — creates `.venv-parakeet`, downloads the CTC-path mlpackages (~220 MB)
   into `models/` (gitignored).
 - `run_ctc.py` — evidence runner: transcribes the three test clips CPU-only, compares to
-  goldens, times a warm run. Also works as `run_ctc.py some.wav` for one-offs.
+  goldens, times a warm run. Also works as `run_ctc.py some.wav` for one-offs, and takes
+  `--precision int8` to run the quantized build in `models/int8/`.
+- `make_int8.py` — produces `models/int8/` from the fetched packages.
