@@ -1,10 +1,14 @@
-"""Converts UsefulSensors/moonshine-tiny to two Core ML models.
+"""Converts UsefulSensors/moonshine-{tiny,base} (pick with --model) to two Core ML models.
 
-Encoder: enumerated audio lengths 1..12 s → encoder_states [1, F, 288] fp16.
+Encoder: enumerated audio lengths 1..12 s → encoder_states [1, F, hidden] fp16.
 Decoder: one token per call, fixed shapes, self-attention KV cache in Core ML
 state, argmax inside. See docs/superpowers/specs/2026-08-22-moonshine-watch-captions-design.md.
+
+Every model dimension (hidden size, layers, heads, head_dim, rotary dim, KV-cache
+shape, max positions) is read from the loaded checkpoint's config at runtime —
+nothing size-specific is hardcoded. Tiny artifacts go to build/, base to build-base/.
 """
-import argparse, shutil, subprocess
+import argparse, shutil, subprocess, sys
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -14,10 +18,11 @@ import torch
 from transformers import MoonshineForConditionalGeneration
 from transformers.models.moonshine import modeling_moonshine as _moonshine_hf
 
-# = hf.model.{encoder,decoder}.rotary_emb.inv_freq.numel() for moonshine-tiny, i.e.
-# int(hidden_size/num_attention_heads * partial_rotary_factor) // 2 = int(36 * 0.9) // 2 = 16.
-# Verified empirically against the loaded model; both encoder and decoder use the same config.
-ROTARY_HALF_DIM = 16
+# = hf.model.{encoder,decoder}.rotary_emb.inv_freq.numel(), i.e.
+# int(hidden_size/num_attention_heads * partial_rotary_factor) // 2 — 16 for tiny
+# (int(36 * 0.9) // 2) and also 16 for base (int(52 * 0.62) // 2). Set from the loaded
+# model's config by configure() below (and asserted against inv_freq) before anything is traced.
+ROTARY_HALF_DIM = None
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
@@ -133,12 +138,32 @@ def traceable_encoder_attention():
         _moonshine_hf.MoonshineAttention.forward = original
 
 
-MODEL_ID = "UsefulSensors/moonshine-tiny"
+MODEL_IDS = {"tiny": "UsefulSensors/moonshine-tiny", "base": "UsefulSensors/moonshine-base"}
 SAMPLE_RATE = 16000
 BUCKET_SECONDS = list(range(1, 13))
-MAX_FRAMES = 500          # 12 s of audio is 498 encoder frames
-MAX_POSITIONS = 194       # bos + 193 tokens (config.max_position_embeddings)
+MAX_FRAMES = 500          # 12 s of audio is 498 encoder frames (same conv stack in every Moonshine size)
+MAX_POSITIONS = None      # bos + generated tokens; config.max_position_embeddings, set by configure()
 NEG = -1e4                # additive mask value; fp16-safe
+
+
+def configure(hf) -> None:
+    """Sets the config-derived module globals the traced modules read. Called right after loading
+    the checkpoint, before anything is traced. ROTARY_HALF_DIM is computed from the config formula
+    and then verified against both rotary embeddings' actual inv_freq buffers so a checkpoint or
+    transformers change that shifts it fails loudly instead of silently producing shape-valid-but-
+    wrong rotary embeddings."""
+    global MAX_POSITIONS, ROTARY_HALF_DIM
+    cfg = hf.config
+    MAX_POSITIONS = cfg.max_position_embeddings
+    head_dim = cfg.hidden_size // cfg.decoder_num_attention_heads
+    ROTARY_HALF_DIM = int(head_dim * cfg.partial_rotary_factor) // 2
+    for name, mod in (("encoder", hf.model.encoder), ("decoder", hf.model.decoder)):
+        got = mod.rotary_emb.inv_freq.numel()
+        assert got == ROTARY_HALF_DIM, (
+            f"ROTARY_HALF_DIM={ROTARY_HALF_DIM} (from config: head_dim {head_dim} * "
+            f"partial_rotary_factor {cfg.partial_rotary_factor}) does not match this checkpoint's "
+            f"{name} rotary_emb.inv_freq (numel={got}); fix configure() in convert.py"
+        )
 
 
 class Encoder(torch.nn.Module):
@@ -147,7 +172,7 @@ class Encoder(torch.nn.Module):
         self.enc = hf.model.encoder
 
     def forward(self, audio):                      # [1, T] float32 in [-1, 1]
-        return self.enc(audio).last_hidden_state   # [1, F, 288]
+        return self.enc(audio).last_hidden_state   # [1, F, hidden]
 
 
 class Decoder(torch.nn.Module):
@@ -162,7 +187,7 @@ class Decoder(torch.nn.Module):
         self.dec = hf.model.decoder
         self.proj_out = hf.proj_out
         self.heads = cfg.decoder_num_attention_heads
-        self.head_dim = cfg.hidden_size // self.heads          # 36; HF pads to 40 for its kernel only
+        self.head_dim = cfg.hidden_size // self.heads          # 36 tiny / 52 base; HF may pad for its kernel only
         self.hidden = cfg.hidden_size
         n_layers = len(self.dec.layers)
         shape = (n_layers, 1, self.heads, MAX_POSITIONS, self.head_dim)
@@ -170,10 +195,10 @@ class Decoder(torch.nn.Module):
         self.register_buffer("v_cache", torch.zeros(shape))
 
     def forward(self, token, encoder_states, frames, position):
-        # token [1,1] int32 · encoder_states [1,MAX_FRAMES,288] · frames [1] int32 · position [1] int32
+        # token [1,1] int32 · encoder_states [1,MAX_FRAMES,hidden] · frames [1] int32 · position [1] int32
         position = position.long()
         frames = frames.long()
-        x = self.dec.embed_tokens(token.long())                                # [1,1,288]
+        x = self.dec.embed_tokens(token.long())                                # [1,1,hidden]
         cos, sin = self.dec.rotary_emb(x, position.view(1, 1))                 # rotary for this one position
         pos = position.view(1, 1, 1, 1)
         tok_idx = torch.arange(MAX_POSITIONS).view(1, 1, 1, MAX_POSITIONS)
@@ -190,7 +215,7 @@ class Decoder(torch.nn.Module):
             h = layer.final_layernorm(x)
             x = x + layer.mlp(h)
         x = self.dec.norm(x)
-        logits = self.proj_out(x)                                              # [1,1,32768]
+        logits = self.proj_out(x)                                              # [1,1,vocab]
         return torch.argmax(logits, dim=-1).to(torch.int32).view(1)
 
     def _heads(self, t, n):
@@ -221,7 +246,7 @@ class Decoder(torch.nn.Module):
         return attn.o_proj(o)
 
 
-def convert_encoder(hf, out: Path) -> Path:
+def convert_encoder(hf, out: Path, model_name: str) -> Path:
     enc = Encoder(hf).eval()
     example = torch.zeros(1, 4 * SAMPLE_RATE)
     with traceable_encoder_attention():
@@ -237,13 +262,13 @@ def convert_encoder(hf, out: Path) -> Path:
             convert_to="mlprogram",
             compute_precision=ct.precision.FLOAT16,
         )
-    model.short_description = "Moonshine Tiny encoder (UsefulSensors/moonshine-tiny), MIT"
+    model.short_description = f"Moonshine {model_name.capitalize()} encoder ({MODEL_IDS[model_name]}), MIT"
     path = out / "Encoder.mlpackage"
     model.save(str(path))
     return path
 
 
-def convert_decoder(hf, out: Path) -> Path:
+def convert_decoder(hf, out: Path, model_name: str) -> Path:
     dec = Decoder(hf).eval()
     example = (torch.ones(1, 1, dtype=torch.int32),
                torch.zeros(1, MAX_FRAMES, hf.config.hidden_size),
@@ -269,7 +294,7 @@ def convert_decoder(hf, out: Path) -> Path:
         convert_to="mlprogram",
         compute_precision=ct.precision.FLOAT16,
     )
-    model.short_description = "Moonshine Tiny decoder step (UsefulSensors/moonshine-tiny), MIT"
+    model.short_description = f"Moonshine {model_name.capitalize()} decoder step ({MODEL_IDS[model_name]}), MIT"
     path = out / "Decoder.mlpackage"
     model.save(str(path))
     return path
@@ -282,12 +307,12 @@ def compile_model(package: Path, out: Path) -> Path:
     return compiled
 
 
-def smoke_test(out: Path) -> None:
+def smoke_test(out: Path, hidden: int) -> None:
     enc = ct.models.MLModel(str(out / "Encoder.mlpackage"))
     dec = ct.models.MLModel(str(out / "Decoder.mlpackage"))
     states = enc.predict({"audio": np.zeros((1, SAMPLE_RATE), dtype=np.float32)})["encoder_states"]
-    assert states.shape == (1, 40, 288), states.shape   # 1 s → 40 frames
-    padded = np.zeros((1, MAX_FRAMES, 288), dtype=np.float16)
+    assert states.shape == (1, 40, hidden), states.shape   # 1 s → 40 frames
+    padded = np.zeros((1, MAX_FRAMES, hidden), dtype=np.float16)
     padded[:, :40] = states
     state = dec.make_state()
     out_token = dec.predict({"token": np.array([[1]], dtype=np.int32), "encoder_states": padded,
@@ -299,25 +324,27 @@ def smoke_test(out: Path) -> None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", type=Path, default=Path("../build"))
+    ap.add_argument("--model", choices=sorted(MODEL_IDS), default="tiny")
+    ap.add_argument("--out", type=Path, default=None,
+                    help="output dir; defaults to ../build for tiny, ../build-<model> otherwise")
     ap.add_argument("--skip-encoder", action="store_true")
     ap.add_argument("--skip-decoder", action="store_true")
     args = ap.parse_args()
+    if args.out is None:
+        args.out = Path("../build") if args.model == "tiny" else Path(f"../build-{args.model}")
     args.out.mkdir(parents=True, exist_ok=True)
 
-    hf = MoonshineForConditionalGeneration.from_pretrained(MODEL_ID, torch_dtype=torch.float32).eval()
-    assert hf.model.decoder.rotary_emb.inv_freq.numel() == ROTARY_HALF_DIM, (
-        f"ROTARY_HALF_DIM={ROTARY_HALF_DIM} no longer matches this checkpoint's decoder "
-        f"rotary_emb.inv_freq (numel={hf.model.decoder.rotary_emb.inv_freq.numel()}); "
-        f"update the constant in convert.py"
-    )
+    hf = MoonshineForConditionalGeneration.from_pretrained(MODEL_IDS[args.model], torch_dtype=torch.float32).eval()
+    configure(hf)
     if not args.skip_encoder:
-        compile_model(convert_encoder(hf, args.out), args.out)
+        compile_model(convert_encoder(hf, args.out, args.model), args.out)
     if not args.skip_decoder:
-        compile_model(convert_decoder(hf, args.out), args.out)
+        compile_model(convert_decoder(hf, args.out, args.model), args.out)
     if not (args.out / "vocab.json").exists():
-        subprocess.run(["uv", "run", "python", "export_vocab.py", str(args.out / "vocab.json")], check=True)
-    smoke_test(args.out)
+        # All released Moonshine sizes share one tokenizer, so vocab.json is model-independent
+        # (export_vocab.py reads moonshine-tiny's; parity for base then proves it decodes identically).
+        subprocess.run([sys.executable, "export_vocab.py", str(args.out / "vocab.json")], check=True)
+    smoke_test(args.out, hf.config.hidden_size)
     print("models in", args.out.resolve())
 
 

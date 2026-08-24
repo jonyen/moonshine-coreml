@@ -12,12 +12,15 @@ public final class MoonshineModel {
     public static let bucketSeconds = Array(1...12)
     /// The decoder's fixed encoder-state length; 12 s of audio is 498 frames.
     public static let maxFrames = 500
+    /// Moonshine Tiny's hidden size, kept for source compatibility. `encode`
+    /// reads the actual width (288 tiny, 416 base) off the loaded encoder's
+    /// output, so the same code runs either model.
     public static let hiddenSize = 288
     /// Decoder positions: bos plus up to 193 generated tokens.
     public static let maxPositions = 194
 
     public struct Encoded {
-        /// `[1, maxFrames, hiddenSize]` float16, zero beyond `frames`.
+        /// `[1, maxFrames, hidden]` float16, zero beyond `frames`.
         public let states: MLMultiArray
         public let frames: Int
     }
@@ -54,10 +57,11 @@ public final class MoonshineModel {
             throw MoonshineError.missingOutput("encoder_states")
         }
         let frames = min(states.shape[1].intValue, Self.maxFrames)
-        let padded = try MLMultiArray(shape: [1, NSNumber(value: Self.maxFrames), NSNumber(value: Self.hiddenSize)], dataType: .float16)
-        let total = Self.maxFrames * Self.hiddenSize
+        let hidden = states.shape[2].intValue   // 288 tiny, 416 base — read from the model, not assumed
+        let padded = try MLMultiArray(shape: [1, NSNumber(value: Self.maxFrames), NSNumber(value: hidden)], dataType: .float16)
+        let total = Self.maxFrames * hidden
         memset(padded.dataPointer, 0, total * MemoryLayout<Float16>.size)
-        let used = frames * Self.hiddenSize
+        let used = frames * hidden
         if states.dataType == .float16, Self.isContiguous(states) {
             memcpy(padded.dataPointer, states.dataPointer, used * MemoryLayout<Float16>.size)
         } else {

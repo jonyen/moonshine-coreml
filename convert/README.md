@@ -1,7 +1,10 @@
 # convert
 
-Converts [UsefulSensors/moonshine-tiny](https://huggingface.co/UsefulSensors/moonshine-tiny) (Hugging
-Face PyTorch) to Core ML: an enumerated-shape encoder and a fixed-shape stateful decoder.
+Converts [UsefulSensors/moonshine-tiny](https://huggingface.co/UsefulSensors/moonshine-tiny) or
+[UsefulSensors/moonshine-base](https://huggingface.co/UsefulSensors/moonshine-base) (Hugging Face
+PyTorch; pick with `--model tiny|base`, default tiny) to Core ML: an enumerated-shape encoder and a
+fixed-shape stateful decoder. Every model dimension is read from the loaded checkpoint's config at
+runtime.
 
 ## Setup
 
@@ -19,30 +22,35 @@ warning reappears with a future `uv sync`.
 
 ```bash
 cd convert
-uv run python convert.py --out ../build
+uv run python convert.py --out ../build          # tiny (the default)
+uv run python convert.py --model base            # base → ../build-base
 ```
 
-This downloads (or reuses the local Hugging Face cache for) `UsefulSensors/moonshine-tiny`, traces
-the encoder and decoder with `torch.jit.trace`, converts both to Core ML with `coremltools`,
-compiles each `.mlpackage` to `.mlmodelc` with `xcrun coremlcompiler`, writes `vocab.json`, and runs
-a shape-only smoke test.
+This downloads (or reuses the local Hugging Face cache for) the chosen checkpoint, traces the
+encoder and decoder with `torch.jit.trace`, converts both to Core ML with `coremltools`, compiles
+each `.mlpackage` to `.mlmodelc` with `xcrun coremlcompiler`, writes `vocab.json`, and runs a
+shape-only smoke test. `--out` defaults to `../build` for tiny and `../build-<model>` otherwise.
 
-`build/` (gitignored) ends up with:
+`build/` (gitignored, `build-base/` likewise for base) ends up with:
 
 - `Encoder.mlpackage` / `Encoder.mlmodelc`
 - `Decoder.mlpackage` / `Decoder.mlmodelc`
 - `vocab.json` — a JSON array of 32768 strings, index = token id (also produced standalone by
-  `uv run python export_vocab.py ../build/vocab.json`)
+  `uv run python export_vocab.py ../build/vocab.json`). Tiny and base ship the same tokenizer
+  (verified: identical `get_vocab()`), so the file is model-independent.
 
 Flags: `--skip-encoder` / `--skip-decoder` skip converting that model (useful when iterating on one
 side); `vocab.json` is only (re)written if it does not already exist at `--out`.
 
 ## Input/output contract
 
+With hidden = 288 (tiny) / 416 (base), layers = 6 / 8, head_dim = 36 / 52:
+
 - Encoder: input `audio` float32 `[1, T]`, T ∈ {16000·s | s = 1…12}; output `encoder_states`
-  float16 `[1, F, 288]`.
-- Decoder: inputs `token` int32 `[1,1]`, `encoder_states` float16 `[1,500,288]`, `frames` int32
-  `[1]`, `position` int32 `[1]`; states `k_cache`, `v_cache` float16 `[6,1,8,194,36]`; output
+  float16 `[1, F, hidden]`.
+- Decoder: inputs `token` int32 `[1,1]`, `encoder_states` float16 `[1,500,hidden]`, `frames` int32
+  `[1]`, `position` int32 `[1]`; states `k_cache`, `v_cache` float16
+  `[layers,1,8,194,head_dim]` (tiny `[6,1,8,194,36]`, base `[8,1,8,194,52]`); output
   `next_token` int32 `[1]`.
 
 The decoder runs one greedy step per call: the causal mask, the encoder padding mask, and the
@@ -65,11 +73,12 @@ is scoped with the `traceable_encoder_attention()` context manager, applied only
 `convert_encoder`'s `torch.jit.trace`/`ct.convert` calls, and restored on exit — it never leaks
 process-global, so the Decoder path (and any stock HF forward/generate call sharing the process)
 always sees the original installed implementation. See the docstrings on both functions for the
-exact diff. `ROTARY_HALF_DIM = 16` was verified empirically against
-`hf.model.{encoder,decoder}.rotary_emb.inv_freq.shape` for `moonshine-tiny`; `main()` asserts this
-against `hf.model.decoder.rotary_emb.inv_freq.numel()` right after loading the model, so a future
-transformers/checkpoint change that shifts this value fails loudly instead of silently producing
-shape-valid-but-wrong rotary embeddings.
+exact diff. `ROTARY_HALF_DIM` is computed from the loaded config by `configure()` —
+`int(head_dim * partial_rotary_factor) // 2`, which comes to 16 for both tiny (`int(36*0.9)//2`)
+and base (`int(52*0.62)//2`) — and asserted against both the encoder's and decoder's
+`rotary_emb.inv_freq.numel()` right after loading the model, so a future transformers/checkpoint
+change that shifts this value fails loudly instead of silently producing shape-valid-but-wrong
+rotary embeddings.
 
 `ct.convert()` also prints two harmless messages worth knowing about, not errors:
 `Torch var v_cache/k_cache is added again` (informational, from tracing an in-place buffer write
@@ -83,7 +92,7 @@ succeeds. Actual compute-unit placement and performance are out of scope here �
 ## What the smoke test does and does not prove
 
 `smoke_test()` in `convert.py` only checks output **shapes and dtypes** — that the encoder produces
-`(1, 40, 288)` for 1 s of silence and that the decoder's `next_token` is a `(1,)` int32 array. It
+`(1, 40, hidden)` for 1 s of silence and that the decoder's `next_token` is a `(1,)` int32 array. It
 does **not** check numerical correctness (e.g. that the decoder actually reproduces the reference
 HF model's logits/argmax). That correctness check is `parity_test.py` (task 5), which compares the
 compiled Core ML models against the HF PyTorch reference on real audio.
