@@ -15,6 +15,9 @@ public protocol Transcribing: AnyObject {
 /// so a final is never followed by a stale gray line. If two or more finals are
 /// waiting, inference is behind real time and interims are skipped entirely
 /// until it catches up.
+///
+/// `onPartial`, `onFinal` and `onError` are invoked on the internal inference
+/// queue — hop to the main actor before touching UI.
 public final class LiveTranscriber {
     public var onPartial: ((String) -> Void)?
     public var onFinal: ((String) -> Void)?

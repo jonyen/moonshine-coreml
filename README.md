@@ -51,8 +51,8 @@ live.flush() // ends the open segment as a final
 ## Bench
 
 ```bash
-swift run moonshine-bench --models build test-assets/hello.wav
-swift run moonshine-bench --models build test-assets/hello.wav --cpu
+swift run -c release moonshine-bench --models build test-assets/hello.wav
+swift run -c release moonshine-bench --models build test-assets/hello.wav --cpu
 ```
 
 On `test-assets/hello.wav` (3.0 s), M4 Pro, warm:
