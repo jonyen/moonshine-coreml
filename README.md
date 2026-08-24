@@ -35,6 +35,56 @@ which downloads and unzips the release asset into `build/` for tiny, `build-base
 directory you pass as a final argument). See `convert/README.md` if you'd rather produce them
 yourself from the original weights.
 
+## Parakeet (ParakeetKit)
+
+v0.3.0 adds a second engine behind the same `Transcribing` protocol:
+[`nvidia/parakeet-tdt_ctc-110m`](https://huggingface.co/nvidia/parakeet-tdt_ctc-110m) run down
+its CTC path. It is ~4x the size of Moonshine tiny on disk but emits punctuation and
+capitalisation, and its mel frontend is baked into the encoder — raw 16 kHz audio in, no DSP in
+Swift. The encoder takes a fixed 15 s window (zero-padded, true length passed alongside), so
+every transcription pays the full-window encode regardless of clip length.
+
+Both builds transcribe the three `test-assets/` clips character-for-character identically to the
+golden transcripts. Bench is `parakeet-bench` on `test-assets/hello.wav` (3.0 s), M4 Pro, warm
+mean of 5:
+
+| build | params | size | warm `.cpuOnly` | RTF | warm `.all` |
+|-------|--------|------|-----------------|------|-------------|
+| fp16 (zip root) | ~103 M shipped (110m checkpoint) | 208 MB | 26 ms | 0.009 | 13 ms |
+| int8 (`int8/`)  | same, weights int8 | 105 MB | 26 ms | 0.009 | 13 ms |
+
+The release asset `parakeet-ctc-110m-coreml-v<version>.zip` contains, at its root,
+`Encoder.mlmodelc/` (mel + FastConformer encoder), `CTCHead.mlmodelc/`, `vocab.json`
+(1024 SentencePiece pieces; CTC blank is 1024) — that root build's weights are fp16, which is
+how the upstream conversion ships — plus `int8/`, the same three files with weights
+linear-quantized to int8. Fetch with:
+
+```bash
+Scripts/fetch-models.sh 0.3.0 parakeet   # → build-parakeet/
+```
+
+```swift
+import MoonshineKit
+import ParakeetKit
+
+let model = try ParakeetModel(directory: modelsDirectory)   // computeUnits: .cpuOnly on the watch
+let live = LiveTranscriber(transcriber: ParakeetTranscriber(model: model))
+```
+
+`ParakeetTranscriber` conforms to MoonshineKit's `Transcribing`, so the `Segmenter` /
+`LiveTranscriber` pipeline (and anything else built on it) takes it unchanged. Bench with
+`swift run -c release parakeet-bench --models build-parakeet test-assets/hello.wav --cpu`; run
+the integration tests with `PARAKEET_MODELS=$PWD/build-parakeet swift test`. Packaging is
+`Scripts/package-models.sh <version> parakeet`, which compiles the mlpackages fetched by
+`convert/parakeet/fetch_models.sh` (see [`convert/parakeet/README.md`](convert/parakeet/README.md)).
+
+**License:** the Parakeet model is CC-BY-4.0 — the checkpoint is NVIDIA's
+`parakeet-tdt_ctc-110m`, converted to Core ML by
+[OpenVoiceOS/parakeet-tdt-ctc-110m-coreml](https://huggingface.co/OpenVoiceOS/parakeet-tdt-ctc-110m-coreml);
+this repo repackages that conversion's CTC path (compiled to `.mlmodelc`, plus the int8
+quantization) without architectural changes. Attribution to both is required; commercial use is
+fine. MoonshineKit/ParakeetKit code stays MIT.
+
 ## Using MoonshineKit
 
 ```swift
@@ -100,12 +150,15 @@ cd convert && uv run python parity_test.py --model base  # base, against build-b
 swift test
 MOONSHINE_MODELS=$PWD/build swift test
 MOONSHINE_MODELS=$PWD/build-base swift test
+PARAKEET_MODELS=$PWD/build-parakeet swift test
 ```
 
 The first runs everything that doesn't need the compiled models. Setting `MOONSHINE_MODELS` to a
 directory containing `Encoder.mlmodelc`, `Decoder.mlmodelc` and `vocab.json` (either model size)
 additionally enables `TranscriberIntegrationTests`, which run real audio through the models end to
-end.
+end. Setting `PARAKEET_MODELS` to a directory containing `Encoder.mlmodelc`, `CTCHead.mlmodelc`
+and `vocab.json` (the fp16 root or the `int8/` variant) likewise enables
+`ParakeetIntegrationTests`.
 
 ## Related
 
@@ -115,4 +168,6 @@ end.
 
 ## License
 
-This repo is MIT (see `LICENSE`). The model is `UsefulSensors/moonshine-tiny`, also MIT.
+This repo is MIT (see `LICENSE`). The Moonshine models are `UsefulSensors/moonshine-tiny` and
+`UsefulSensors/moonshine-base`, also MIT. The Parakeet model is CC-BY-4.0 (NVIDIA checkpoint,
+OpenVoiceOS Core ML conversion — see the attribution in the Parakeet section above).
