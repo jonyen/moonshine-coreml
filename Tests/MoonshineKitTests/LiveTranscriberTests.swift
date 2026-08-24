@@ -124,16 +124,21 @@ final class LiveTranscriberTests: XCTestCase {
 
     func testBacklogSkipsInterims() {
         fake.gate = DispatchSemaphore(value: 0)
-        let live = makeLive()
-        // Two complete utterances while the first job is stuck, then a third still talking.
-        speak(live, chunks: 3); hush(live, chunks: 7)
-        waitUntil { self.fake.calls.count == 1 }   // final #1 running, blocked
-        speak(live, chunks: 3); hush(live, chunks: 7)   // final #2 queued
-        speak(live, chunks: 3); hush(live, chunks: 7)   // final #3 queued → two waiting
-        speak(live, chunks: 8)                          // pre-roll is empty after a close, so the interim is on the 8th chunk — and skipped: 2 finals wait
+        // A short close (3_200 samples of silence) so a two-chunk utterance
+        // finalises before its first interim is due — every event below is
+        // deterministic, no drain-vs-feed race.
+        let live = LiveTranscriber(transcriber: fake, segmenter: Segmenter(silenceToClose: 3_200))
+        live.onPartial = { [self] t in lock.lock(); partials.append(t); lock.unlock() }
+        live.onFinal = { [self] t in lock.lock(); finals.append(t); lock.unlock() }
+        hush(live, chunks: 5)                           // fills the pre-roll
+        speak(live, chunks: 2); hush(live, chunks: 2)   // final #1 (4_800 + 1_600 + 3_200)
+        waitUntil { self.fake.calls.count == 1 }        // …taken by the drain and blocked
+        speak(live, chunks: 2); hush(live, chunks: 2)   // final #2 queued (1_600 + 1_600 + 3_200)
+        speak(live, chunks: 2); hush(live, chunks: 2)   // final #3 queued → two waiting
+        speak(live, chunks: 8)                          // interim due on the 8th chunk — skipped: 2 finals wait
         fake.release()
         waitUntil { live.isIdle }
-        XCTAssertEqual(fake.calls.count, 3, "three finals, no interim: \(fake.calls.map(\.count))")
+        XCTAssertEqual(fake.calls.map(\.count), [9_600, 6_400, 6_400], "three finals, no interim")
         XCTAssertEqual(partials, [])
         XCTAssertEqual(finals, ["hello", "hello", "hello"])
     }
