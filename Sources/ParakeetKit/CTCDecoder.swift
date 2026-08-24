@@ -4,7 +4,7 @@ import Foundation
 /// collapse repeated ids, drop blanks, look the survivors up in the piece
 /// list, `▁` → space. The vocabulary has no `<0xNN>` byte-fallback pieces, so
 /// id → string lookup is the whole detokenizer (this mirrors the reference
-/// decode in `convert/parakeet/run_ctc.py` exactly).
+/// decode in `convert/parakeet/run_ctc.py`, plus an out-of-range id guard).
 public struct CTCDecoder {
     public let vocab: [String]
     public let blankID: Int
