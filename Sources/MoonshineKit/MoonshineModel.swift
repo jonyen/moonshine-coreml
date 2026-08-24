@@ -35,7 +35,8 @@ public final class MoonshineModel {
     }
 
     /// Runs the encoder on `audio` (Float in -1...1) padded to its bucket, and
-    /// lays the result into the decoder's fixed-size input.
+    /// lays the result into the decoder's fixed-size input. Empty audio
+    /// encodes as one second of silence (the padded buffer is already zeroed).
     public func encode(_ audio: [Float]) throws -> Encoded {
         let seconds = min(Self.bucketSeconds.last!,
                           max(1, Int((Double(audio.count) / Double(Self.sampleRate)).rounded(.up))))
@@ -44,7 +45,9 @@ public final class MoonshineModel {
         let p = input.dataPointer.bindMemory(to: Float.self, capacity: length)
         p.initialize(repeating: 0, count: length)
         let n = min(audio.count, length)
-        audio.withUnsafeBufferPointer { p.update(from: $0.baseAddress!, count: n) }
+        if n > 0 {
+            audio.withUnsafeBufferPointer { p.update(from: $0.baseAddress!, count: n) }
+        }
 
         let out = try encoder.prediction(from: MLDictionaryFeatureProvider(dictionary: ["audio": MLFeatureValue(multiArray: input)]))
         guard let states = out.featureValue(for: "encoder_states")?.multiArrayValue else {

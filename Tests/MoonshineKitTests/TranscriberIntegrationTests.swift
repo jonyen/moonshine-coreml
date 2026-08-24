@@ -47,6 +47,11 @@ final class TranscriberIntegrationTests: XCTestCase {
         XCTAssertEqual(try model.encode([Float](repeating: 0, count: 20 * 16_000)).frames, 498, "over-long audio is truncated to 12 s")
     }
 
+    func testEmptyAudioEncodesAsSilence() throws {
+        let model = try loadModel()
+        XCTAssertEqual(try model.encode([]).frames, 40)   // one second of padded silence
+    }
+
     func testMaxTokensRule() {
         XCTAssertEqual(Transcriber.maxTokens(forSamples: 16_000), 8)        // 6.5 + 2 → 8
         XCTAssertEqual(Transcriber.maxTokens(forSamples: 12 * 16_000), 80)  // 78 + 2
