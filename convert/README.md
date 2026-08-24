@@ -60,12 +60,16 @@ tainted as dynamic by coremltools' shape inference, and the conversion fails wit
 `convert.py` works around this with two functions that are drop-in behavioral copies of the
 installed ones, differing only in how they obtain those two static ints — `apply_rotary_pos_emb` at
 module scope (used by both the encoder, via a `MoonshineAttention.forward` monkeypatch, and the
-Decoder wrapper's own self-attention) and `_traceable_attention_forward` (monkeypatched onto
-`MoonshineAttention.forward`, so it only affects the encoder — the Decoder wrapper never calls
-`attn.forward()`, only the raw `q_proj`/`k_proj`/`v_proj`/`o_proj`/`scaling` submodules). See the
-docstrings on both for the exact diff. `ROTARY_HALF_DIM = 16` was verified empirically against
-`hf.model.{encoder,decoder}.rotary_emb.inv_freq.shape` for `moonshine-tiny`; if this ever converts
-against a different checkpoint, re-verify that constant first.
+Decoder wrapper's own self-attention) and `_traceable_attention_forward`. The `forward` monkeypatch
+is scoped with the `traceable_encoder_attention()` context manager, applied only around
+`convert_encoder`'s `torch.jit.trace`/`ct.convert` calls, and restored on exit — it never leaks
+process-global, so the Decoder path (and any stock HF forward/generate call sharing the process)
+always sees the original installed implementation. See the docstrings on both functions for the
+exact diff. `ROTARY_HALF_DIM = 16` was verified empirically against
+`hf.model.{encoder,decoder}.rotary_emb.inv_freq.shape` for `moonshine-tiny`; `main()` asserts this
+against `hf.model.decoder.rotary_emb.inv_freq.numel()` right after loading the model, so a future
+transformers/checkpoint change that shifts this value fails loudly instead of silently producing
+shape-valid-but-wrong rotary embeddings.
 
 `ct.convert()` also prints two harmless messages worth knowing about, not errors:
 `Torch var v_cache/k_cache is added again` (informational, from tracing an in-place buffer write

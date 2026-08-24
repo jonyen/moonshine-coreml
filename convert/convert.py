@@ -5,6 +5,7 @@ Decoder: one token per call, fixed shapes, self-attention KV cache in Core ML
 state, argmax inside. See docs/superpowers/specs/2026-08-22-moonshine-watch-captions-design.md.
 """
 import argparse, shutil, subprocess
+from contextlib import contextmanager
 from pathlib import Path
 
 import coremltools as ct
@@ -47,9 +48,10 @@ def _traceable_attention_forward(self, hidden_states, position_embeddings=None, 
     tuple-slice-then-unpack form emits an aten::size/aten::Int pair that coremltools 9.0 cannot convert
     once the sequence length is a dynamic (EnumeratedShapes/RangeDim) dim: `TypeError: only
     0-dimensional arrays can be converted to Python scalars` inside torch frontend op `_int`. This is
-    the only behavioral change from the installed module; monkeypatched onto MoonshineAttention below
-    (affects only calls that go through `attn.forward()`, i.e. the encoder — the Decoder wrapper below
-    calls q_proj/k_proj/v_proj/o_proj directly and never hits this method)."""
+    the only behavioral change from the installed module; monkeypatched onto MoonshineAttention only
+    for the duration of `traceable_encoder_attention()` below (affects only calls that go through
+    `attn.forward()`, i.e. the encoder — the Decoder wrapper below calls q_proj/k_proj/v_proj/o_proj
+    directly and never hits this method)."""
     bsz = hidden_states.shape[0]
     q_len = hidden_states.shape[1]
 
@@ -116,7 +118,20 @@ def _traceable_attention_forward(self, hidden_states, position_embeddings=None, 
     return attn_output, attn_weights
 
 
-_moonshine_hf.MoonshineAttention.forward = _traceable_attention_forward
+@contextmanager
+def traceable_encoder_attention():
+    """Monkeypatches MoonshineAttention.forward to _traceable_attention_forward for the duration of
+    this context, then restores the original implementation — scoped to the encoder's trace+convert
+    only (see convert_encoder below). The patch must not leak process-global: the Decoder path (and
+    any stock HF forward/generate call that might share this process) needs to see the original
+    installed implementation, not the encoder-only workaround."""
+    original = _moonshine_hf.MoonshineAttention.forward
+    _moonshine_hf.MoonshineAttention.forward = _traceable_attention_forward
+    try:
+        yield
+    finally:
+        _moonshine_hf.MoonshineAttention.forward = original
+
 
 MODEL_ID = "UsefulSensors/moonshine-tiny"
 SAMPLE_RATE = 16000
@@ -209,18 +224,19 @@ class Decoder(torch.nn.Module):
 def convert_encoder(hf, out: Path) -> Path:
     enc = Encoder(hf).eval()
     example = torch.zeros(1, 4 * SAMPLE_RATE)
-    with torch.no_grad():
-        traced = torch.jit.trace(enc, example)
-    shapes = ct.EnumeratedShapes(shapes=[[1, s * SAMPLE_RATE] for s in BUCKET_SECONDS],
-                                 default=[1, 4 * SAMPLE_RATE])
-    model = ct.convert(
-        traced,
-        inputs=[ct.TensorType(name="audio", shape=shapes, dtype=np.float32)],
-        outputs=[ct.TensorType(name="encoder_states", dtype=np.float16)],
-        minimum_deployment_target=ct.target.iOS18,
-        convert_to="mlprogram",
-        compute_precision=ct.precision.FLOAT16,
-    )
+    with traceable_encoder_attention():
+        with torch.no_grad():
+            traced = torch.jit.trace(enc, example)
+        shapes = ct.EnumeratedShapes(shapes=[[1, s * SAMPLE_RATE] for s in BUCKET_SECONDS],
+                                     default=[1, 4 * SAMPLE_RATE])
+        model = ct.convert(
+            traced,
+            inputs=[ct.TensorType(name="audio", shape=shapes, dtype=np.float32)],
+            outputs=[ct.TensorType(name="encoder_states", dtype=np.float16)],
+            minimum_deployment_target=ct.target.iOS18,
+            convert_to="mlprogram",
+            compute_precision=ct.precision.FLOAT16,
+        )
     model.short_description = "Moonshine Tiny encoder (UsefulSensors/moonshine-tiny), MIT"
     path = out / "Encoder.mlpackage"
     model.save(str(path))
@@ -290,6 +306,11 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
 
     hf = MoonshineForConditionalGeneration.from_pretrained(MODEL_ID, torch_dtype=torch.float32).eval()
+    assert hf.model.decoder.rotary_emb.inv_freq.numel() == ROTARY_HALF_DIM, (
+        f"ROTARY_HALF_DIM={ROTARY_HALF_DIM} no longer matches this checkpoint's decoder "
+        f"rotary_emb.inv_freq (numel={hf.model.decoder.rotary_emb.inv_freq.numel()}); "
+        f"update the constant in convert.py"
+    )
     if not args.skip_encoder:
         compile_model(convert_encoder(hf, args.out), args.out)
     if not args.skip_decoder:
