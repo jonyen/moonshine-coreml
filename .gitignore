@@ -1,0 +1,10 @@
+.build/
+.swiftpm/
+build/
+dist/
+.superpowers/
+convert/.venv/
+convert/__pycache__/
+*.mlpackage
+*.mlmodelc
+.DS_Store
