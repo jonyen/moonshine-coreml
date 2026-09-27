@@ -27,6 +27,32 @@ private final class FakeTranscriber: Transcribing {
     }
 }
 
+/// Leaves an autoreleased object behind on every call, the way Core ML's
+/// prediction outputs do, and records whether the previous call's object was
+/// still alive when the next call started.
+private final class AutoreleasingTranscriber: Transcribing {
+    let gate = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private weak var previous: NSObject?
+    private var _calls = 0
+    private var _previousAliveAtNextCall: [Bool] = []
+    var calls: Int { lock.lock(); defer { lock.unlock() }; return _calls }
+    var previousAliveAtNextCall: [Bool] { lock.lock(); defer { lock.unlock() }; return _previousAliveAtNextCall }
+
+    func transcribe(_ samples: [Int16]) throws -> String {
+        lock.lock()
+        _calls += 1
+        let first = _calls == 1
+        if !first { _previousAliveAtNextCall.append(previous != nil) }
+        lock.unlock()
+        let object = NSObject()
+        _ = Unmanaged.passRetained(object).autorelease()
+        lock.lock(); previous = object; lock.unlock()
+        if first { gate.wait() }
+        return "hello"
+    }
+}
+
 private struct Boom: Error {}
 
 final class LiveTranscriberTests: XCTestCase {
@@ -154,5 +180,21 @@ final class LiveTranscriberTests: XCTestCase {
         waitUntil { live.isIdle }
         XCTAssertEqual(fake.calls.count, 1)
         XCTAssertEqual(finals, [])
+    }
+
+    /// Core ML hands back autoreleased outputs. If the drain loop never
+    /// drains its pool between jobs, they pile up for as long as the loop
+    /// stays busy, which in continuous speech is forever: a watch app hit
+    /// its 300 MB jetsam limit this way.
+    func testEachJobsAutoreleasedObjectsAreFreedBeforeTheNext() {
+        let auto = AutoreleasingTranscriber()
+        let live = LiveTranscriber(transcriber: auto)
+        hush(live, chunks: 5)
+        speak(live, chunks: 6)                          // interim: blocks inside the first call
+        waitUntil { auto.calls == 1 }
+        hush(live, chunks: 7)                           // final queued behind it, same drain loop
+        auto.gate.signal()
+        waitUntil { live.isIdle }
+        XCTAssertEqual(auto.previousAliveAtNextCall, [false])
     }
 }

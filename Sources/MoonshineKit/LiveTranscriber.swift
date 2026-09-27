@@ -147,21 +147,31 @@ public final class LiveTranscriber {
 
     // MARK: - Inference thread
 
+    /// One pool per job. Core ML returns its prediction outputs autoreleased,
+    /// and a GCD block only drains its pool when the block returns. In
+    /// continuous speech this loop never returns, so without a pool here
+    /// every job's outputs (about 1.25 MB for Moonshine Base) stay alive
+    /// until the speaker pauses. On a watch that reached the 300 MB jetsam
+    /// limit within minutes.
     private func drain() {
         while let job = nextJob() {
-            if !job.isFinal, !segmentIsOpen(job.segment, generation: job.generation) { continue }
-            do {
-                let text = try transcriber.transcribe(job.audio)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !text.isEmpty, generationMatches(job.generation) else { continue }
-                if job.isFinal {
-                    onFinal?(text)
-                } else if segmentIsOpen(job.segment, generation: job.generation) {
-                    onPartial?(text)
-                }
-            } catch {
-                if generationMatches(job.generation) { onError?(error) }
+            autoreleasepool { run(job) }
+        }
+    }
+
+    private func run(_ job: Job) {
+        if !job.isFinal, !segmentIsOpen(job.segment, generation: job.generation) { return }
+        do {
+            let text = try transcriber.transcribe(job.audio)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty, generationMatches(job.generation) else { return }
+            if job.isFinal {
+                onFinal?(text)
+            } else if segmentIsOpen(job.segment, generation: job.generation) {
+                onPartial?(text)
             }
+        } catch {
+            if generationMatches(job.generation) { onError?(error) }
         }
     }
 }
